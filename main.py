@@ -3,8 +3,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from twilio.rest import Client
 import pandas as pd
-from datetime import datetime, timedelta
-import json
+from datetime import datetime, timedelta, timezone # <-- Changed import
+from zoneinfo import ZoneInfo # <-- Added import for timezones
 
 # --- CONFIGURATION ---
 
@@ -25,8 +25,10 @@ AUDIO_MAPPING = {
     "South": "https://res.cloudinary.com/dqyoxump7/video/upload/v1752949596/bulletin_audio_hindi_20250629_035112.wav_0_nm0yqq.wav", # <-- CHANGE THESE
     "East": "https://res.cloudinary.com/dqyoxump7/video/upload/v1752950393/bulletin_audio_hindi_20250629_123802.wav_1_bozis5.wav",   # <-- CHANGE THESE
     "West": "https://res.cloudinary.com/dqyoxump7/video/upload/v1752950393/bulletin_audio_hindi_20250629_123802.wav_0_evmopy.wav"    # <-- CHANGE THESE
-    # Add all your location-to-audio mappings here
 }
+
+# --- TIMEZONE SETUP ---
+IST = ZoneInfo("Asia/Kolkata") # Define Indian Standard Time
 
 # --- SETUP CLIENTS ---
 
@@ -57,20 +59,23 @@ def check_call_status(call_sid):
     """Fetches the status of a specific call from Twilio."""
     try:
         call = twilio_client.calls.fetch(call_sid)
-        return call.status # e.g., 'completed', 'no-answer', 'busy', 'failed'
+        return call.status
     except Exception as e:
         print(f"Error fetching status for SID {call_sid}: {e}")
-        return "failed" # Assume failed if we can't fetch it
+        return "failed"
 
 def main():
     """Main function to run the process."""
     print("--- Running Voice Agent Script ---")
     data = worksheet.get_all_records()
     df = pd.DataFrame(data)
-    now = datetime.utcnow()
-    print(f"Current UTC time: {now}")
+    
+    # Get the current time in UTC, making it "timezone-aware"
+    now_utc = datetime.now(timezone.utc)
+    print(f"Current UTC time: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Current IST time: {now_utc.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Process 1: Check status of pending calls
+    # --- PROCESS 1: CHECK STATUS OF PENDING CALLS ---
     for index, row in df.iterrows():
         if row['CallStatus'] == 'Initiated' and row['CallSid']:
             status = check_call_status(row['CallSid'])
@@ -80,28 +85,34 @@ def main():
                 print(f"Updating status for {row['PhoneNumber']} (SID: {row['CallSid']}) to '{status}'")
                 
                 if status in ['no-answer', 'busy']:
-                    last_called_time = datetime.strptime(row['LastCalled'], '%Y-%m-%d %H:%M:%S')
-                    retry_time = last_called_time + timedelta(hours=1)
-                    worksheet.update_cell(sheet_row_index, 7, retry_time.strftime('%Y-%m-%d %H:%M:%S')) # Column G: RetryAt
+                    # The LastCalled time is in UTC, so we create an aware object to do math
+                    last_called_utc = datetime.strptime(row['LastCalled'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                    retry_time_utc = last_called_utc + timedelta(hours=1)
+                    worksheet.update_cell(sheet_row_index, 7, retry_time_utc.strftime('%Y-%m-%d %H:%M:%S')) # Column G: RetryAt
                     worksheet.update_cell(sheet_row_index, 5, "Retry Scheduled") # Column E: CallStatus
                 else:
                     final_status = "Delivered" if status == 'completed' else "Failed"
-                    worksheet.update_cell(sheet_row_index, 5, final_status) # Column E: CallStatus
+                    worksheet.update_cell(sheet_row_index, 5, final_status)
 
-    # Process 2: Initiate new scheduled calls
+    # --- PROCESS 2: INITIATE NEW SCHEDULED CALLS ---
     data = worksheet.get_all_records()
     df = pd.DataFrame(data)
     
     for index, row in df.iterrows():
         should_call = False
-        call_time_str = str(row.get('CallTime', ''))
-        retry_time_str = str(row.get('RetryAt', ''))
-
-        if row['CallStatus'] == '' and call_time_str:
-            if datetime.strptime(call_time_str, '%Y-%m-%d %H:%M:%S') < now:
+        
+        # Check for initial calls scheduled in IST
+        if row['CallStatus'] == '' and str(row.get('CallTime', '')):
+            naive_call_time = datetime.strptime(str(row['CallTime']), '%Y-%m-%d %H:%M:%S')
+            aware_call_time_ist = naive_call_time.replace(tzinfo=IST) # Tell Python this time is IST
+            if aware_call_time_ist < now_utc: # Python compares the two aware times correctly
                 should_call = True
-        elif row['CallStatus'] == 'Retry Scheduled' and retry_time_str:
-            if datetime.strptime(retry_time_str, '%Y-%m-%d %H:%M:%S') < now:
+
+        # Check for retries scheduled in UTC
+        elif row['CallStatus'] == 'Retry Scheduled' and str(row.get('RetryAt', '')):
+            naive_retry_time = datetime.strptime(str(row['RetryAt']), '%Y-%m-%d %H:%M:%S')
+            aware_retry_time_utc = naive_retry_time.replace(tzinfo=timezone.utc) # Retry time is in UTC
+            if aware_retry_time_utc < now_utc:
                 should_call = True
 
         if should_call:
@@ -115,10 +126,12 @@ def main():
 
             call_sid, status = make_call(phone_number, audio_url)
             sheet_row_index = index + 2
-            current_utc_time_str = now.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # The 'LastCalled' and 'RetryAt' columns will store time in UTC for consistency
+            last_called_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S')
 
             worksheet.update_cell(sheet_row_index, 5, status)
-            worksheet.update_cell(sheet_row_index, 6, current_utc_time_str)
+            worksheet.update_cell(sheet_row_index, 6, last_called_utc_str)
             if call_sid:
                 worksheet.update_cell(sheet_row_index, 8, call_sid)
 
